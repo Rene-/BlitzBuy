@@ -31,9 +31,16 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; }
   align-items: center;
   gap: .75rem;
   margin-bottom: 2rem;
+  /* Make the header the drag handle for the frameless window.
+     Electron uses this CSS property to know which region moves the window. */
+  -webkit-app-region: drag;
+  user-select: none;
 }
 .app-header h1 { font-size: 1.6rem; font-weight: 700; letter-spacing: -.5px; }
 .app-header h1 span { color: var(--accent); }
+/* Any interactive element inside a drag region must opt back out,
+   otherwise clicks on them get swallowed by the drag handler. */
+.app-header .badge { -webkit-app-region: no-drag; }
 .badge {
   font-size: .65rem;
   font-weight: 600;
