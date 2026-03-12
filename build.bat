@@ -14,9 +14,11 @@ python -m PyInstaller ^
   --hidden-import fake_useragent ^
   --hidden-import tenacity ^
   --hidden-import twocaptcha ^
+  --hidden-import stripe ^
   --collect-all playwright ^
   --collect-all playwright_stealth ^
   --collect-all fake_useragent ^
+  --collect-all stripe ^
   blitzbuy.py
 if errorlevel 1 (echo [ERROR] Python build failed & exit /b 1)
 

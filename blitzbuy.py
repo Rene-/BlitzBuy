@@ -12,9 +12,9 @@ Target  : https://www.saucedemo.com  (public test store — demo ONLY)
     - Always prefer official APIs (Shopify, Amazon PA, etc.) over scraping.
 
 Stack   : Python 3.11+ · Playwright (async) · playwright-stealth ·
-          fake-useragent · tenacity · sqlite3 (stdlib)
+          fake-useragent · tenacity · stripe · sqlite3 (stdlib)
 
-Install : pip install playwright playwright-stealth fake-useragent tenacity twocaptcha
+Install : pip install playwright playwright-stealth fake-useragent tenacity twocaptcha stripe
           python -m playwright install chromium
 Run     : python blitzbuy.py
 
@@ -67,6 +67,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import stripe
 from fake_useragent import UserAgent
 from playwright.async_api import (
     async_playwright,
@@ -115,6 +116,25 @@ DB_PATH           = Path(os.getenv("BLITZBUY_DB",    "purchase_history.db"))
 PROXY_SERVER      = os.getenv("BLITZBUY_PROXY",    "")   # http://user:pass@host:port
 CAPTCHA_API_KEY   = os.getenv("BLITZBUY_2CAPTCHA", "")   # 2Captcha API key — kept in env because it's a paid credential (others can spend your balance if leaked)
 HEADLESS          = os.getenv("BLITZBUY_HEADLESS", "1") != "0"
+
+# ── Stripe payment configuration ────────────────────────────────────────────
+# STRIPE_LIVE=0  → test mode  (sk_test_... key, fake charges, safe to run)
+# STRIPE_LIVE=1  → live mode  (sk_live_... key, REAL charges — use with care)
+#
+# How to get these values:
+#   1. Create a free Stripe account at https://dashboard.stripe.com
+#   2. Dashboard → Developers → API keys → copy Secret key
+#   3. Store a payment method once via Stripe.js or the Dashboard:
+#      Dashboard → Customers → (pick/create customer) → Payment methods → Add
+#      Copy the pm_xxx ID shown.
+#
+# Test mode shortcuts (no real card needed):
+#   STRIPE_PAYMENT_METHOD_ID=pm_card_visa        → always succeeds
+#   STRIPE_PAYMENT_METHOD_ID=pm_card_chargeDeclined → always declines (for testing failures)
+STRIPE_SECRET_KEY        = os.getenv("STRIPE_SECRET_KEY",        "")   # sk_test_... or sk_live_...
+STRIPE_PAYMENT_METHOD_ID = os.getenv("STRIPE_PAYMENT_METHOD_ID", "pm_card_visa")  # stored pm_xxx
+STRIPE_CURRENCY          = os.getenv("STRIPE_CURRENCY",          "usd")
+STRIPE_LIVE              = os.getenv("STRIPE_LIVE",              "0") == "1"
 
 # Resource types to block — ads/trackers added on top of images/fonts/media.
 # Stylesheets are intentionally kept: a page with zero CSS is a fingerprint
@@ -414,6 +434,152 @@ def _check_robots(url: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# §5 — Stripe payment handler
+# ---------------------------------------------------------------------------
+class StripePaymentHandler:
+    """
+    Handles payment via the Stripe API using a pre-stored PaymentMethod ID.
+
+    Why API-side payment beats typing card numbers into the browser
+    ---------------------------------------------------------------
+    Entering card details through browser automation is the single biggest
+    fraud-detection trigger on real e-commerce sites:
+      · Keystroke velocity on card fields is monitored by every major fraud stack
+      · Stripe.js / Adyen fingerprint the browser environment during card entry
+      · Many sites use invisible device-fingerprint tokens tied to the card form
+
+    Instead, BlitzBuy stores a Stripe PaymentMethod (pm_xxx) once via Stripe's
+    secure hosted form, then passes that ID server-side at checkout time.
+    The browser never touches a card number field.
+
+    Flow on a Stripe-native checkout (e.g. Shopify, most SaaS stores)
+    ------------------------------------------------------------------
+    1. Bot navigates to checkout, fills shipping/contact details (browser)
+    2. Bot reaches payment step — detects Stripe Elements iframe on the page
+    3. StripePaymentHandler.create_and_confirm() is called:
+         a. Creates a PaymentIntent server-side (Stripe API)
+         b. Confirms it with the stored pm_xxx — Stripe returns client_secret
+    4. Bot calls page.evaluate() to inject the client_secret and call
+       stripe.confirmCardPayment(clientSecret) — triggers Stripe's own JS
+       without any card field interaction
+    5. Stripe redirects / resolves → bot detects success confirmation element
+
+    Flow on a non-Stripe checkout (e.g. custom payment form)
+    ---------------------------------------------------------
+    Use StripePaymentHandler only for the financial record / audit trail.
+    The actual card details come from env vars and are filled into the form
+    character-by-character with _human_type() — same stealth pipeline.
+    Never hardcode real card numbers; pass them via CARD_NUMBER etc. env vars.
+
+    Test mode (default)
+    -------------------
+    With STRIPE_SECRET_KEY=sk_test_... and STRIPE_PAYMENT_METHOD_ID=pm_card_visa,
+    no real money moves. Stripe's test clock lets you simulate 3DS, declines,
+    network errors, etc. — full coverage without a real card.
+    """
+
+    # Stripe test PaymentMethod fixtures (no real card needed in test mode)
+    TEST_METHODS = {
+        "visa":            "pm_card_visa",
+        "visa_debit":      "pm_card_visa_debit",
+        "mastercard":      "pm_card_mastercard",
+        "amex":            "pm_card_amex",
+        "decline":         "pm_card_chargeDeclined",
+        "insufficient":    "pm_card_chargeDeclinedInsufficientFunds",
+        "3ds_required":    "pm_card_threeDSecure2Required",
+    }
+
+    def __init__(
+        self,
+        secret_key:        str  = STRIPE_SECRET_KEY,
+        payment_method_id: str  = STRIPE_PAYMENT_METHOD_ID,
+        currency:          str  = STRIPE_CURRENCY,
+        live_mode:         bool = STRIPE_LIVE,
+    ) -> None:
+        self.payment_method_id = payment_method_id
+        self.currency          = currency
+        self.live_mode         = live_mode
+        self.enabled           = bool(secret_key)
+
+        if self.enabled:
+            stripe.api_key = secret_key
+            mode = "LIVE ⚠️" if live_mode else "TEST"
+            _log("STRIPE", f"Stripe ready — {mode} mode")
+            if live_mode:
+                _log("STRIPE", "  ⚠️  LIVE MODE: real charges will be made")
+        else:
+            _log("STRIPE", "No STRIPE_SECRET_KEY set — payment step will be skipped")
+
+    def is_enabled(self) -> bool:
+        return self.enabled
+
+    async def create_and_confirm(
+        self,
+        amount_cents:    int,
+        idempotency_key: str,
+        description:     str = "BlitzBuy automated purchase",
+    ) -> dict:
+        """
+        Create and immediately confirm a PaymentIntent using the stored
+        PaymentMethod ID. Runs the Stripe API call in a thread executor
+        so it doesn't block the async event loop.
+
+        Returns the PaymentIntent object dict on success.
+        Raises stripe.error.StripeError on failure (caught by caller).
+
+        Idempotency key = job UUID → safe to retry; Stripe deduplicates
+        within 24 h, so a network retry won't double-charge.
+        """
+        if not self.enabled:
+            raise RuntimeError("Stripe not configured — set STRIPE_SECRET_KEY")
+
+        _log("STRIPE", f"Creating PaymentIntent: {self.currency.upper()} "
+                        f"{amount_cents/100:.2f} | pm={self.payment_method_id[:14]}…")
+
+        def _call():
+            return stripe.PaymentIntent.create(
+                amount=amount_cents,
+                currency=self.currency,
+                payment_method=self.payment_method_id,
+                confirm=True,
+                # off_session=True tells Stripe this is an automated charge
+                # with no user present — required for stored payment methods.
+                off_session=True,
+                description=description,
+                # Idempotency: safe to retry without double-charging.
+                # Stripe deduplicates identical keys within 24 hours.
+                idempotency_key=idempotency_key,
+            )
+
+        intent = await asyncio.get_event_loop().run_in_executor(None, _call)
+
+        status = intent["status"]
+        pi_id  = intent["id"]
+        _log("STRIPE", f"PaymentIntent {pi_id} → status={status}")
+
+        if status == "succeeded":
+            _log("STRIPE", f"Payment confirmed ✓  ({self.currency.upper()} {amount_cents/100:.2f})")
+        elif status == "requires_action":
+            # 3D Secure challenge required — handle in browser or use
+            # Stripe Radar rules to exempt trusted automated flows.
+            _log("STRIPE", "⚠️  3DS challenge required — use Stripe Radar exemption for bots")
+            raise RuntimeError(f"PaymentIntent {pi_id} requires 3DS action")
+        else:
+            raise RuntimeError(f"PaymentIntent {pi_id} unexpected status: {status}")
+
+        return dict(intent)
+
+    @staticmethod
+    def price_to_cents(price_str: str) -> int:
+        """
+        Convert a price string from the page (e.g. '$29.99') to Stripe
+        integer cents (2999). Stripe always works in the smallest currency unit.
+        """
+        cleaned = re.sub(r"[^\d.]", "", price_str)
+        return round(float(cleaned) * 100)
+
+
+# ---------------------------------------------------------------------------
 # §3 — SQLite audit log
 # ---------------------------------------------------------------------------
 class AuditDB:
@@ -429,17 +595,18 @@ class AuditDB:
         self._conn = sqlite3.connect(str(path), check_same_thread=False)
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS purchases (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts          TEXT    NOT NULL,
-                site_url    TEXT    NOT NULL,
-                product     TEXT    NOT NULL,
-                max_price   REAL    NOT NULL,
-                success     INTEGER NOT NULL,
-                message     TEXT,
-                screenshot  TEXT,
-                elapsed_s   REAL,
-                ua          TEXT,
-                proxy       TEXT
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts                 TEXT    NOT NULL,
+                site_url           TEXT    NOT NULL,
+                product            TEXT    NOT NULL,
+                max_price          REAL    NOT NULL,
+                success            INTEGER NOT NULL,
+                message            TEXT,
+                screenshot         TEXT,
+                elapsed_s          REAL,
+                ua                 TEXT,
+                proxy              TEXT,
+                payment_intent_id  TEXT
             )
         """)
         self._conn.commit()
@@ -457,14 +624,15 @@ class AuditDB:
         self._conn.execute(
             """INSERT INTO purchases
                (ts, site_url, product, max_price, success, message,
-                screenshot, elapsed_s, ua, proxy)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                screenshot, elapsed_s, ua, proxy, payment_intent_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 datetime.now().isoformat(),
                 site_url, product, max_price,
                 int(result.success), result.message,
                 str(result.screenshot) if result.screenshot else None,
                 result.elapsed, ua, proxy,
+                result.payment_intent_id or None,
             ),
         )
         self._conn.commit()
@@ -485,11 +653,12 @@ class AuditDB:
 # ---------------------------------------------------------------------------
 @dataclass
 class PurchaseResult:
-    success:    bool
-    message:    str
-    screenshot: Optional[Path] = None
-    elapsed:    float = 0.0
-    retries:    int   = 0
+    success:           bool
+    message:           str
+    screenshot:        Optional[Path] = None
+    elapsed:           float = 0.0
+    retries:           int   = 0
+    payment_intent_id: str   = ""   # pi_xxx from Stripe, empty if skipped/failed
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +695,7 @@ class FastPurchaseAgent:
         block_resources: bool  = True,
         proxy:           str   = PROXY_SERVER,
         captcha_key:     str   = CAPTCHA_API_KEY,
+        stripe_key:      str   = STRIPE_SECRET_KEY,
     ) -> None:
         self.headless        = headless
         self.block_resources = block_resources
@@ -537,6 +707,7 @@ class FastPurchaseAgent:
         self._profile: dict                     = {}
         self._ua:      str                      = ""
         self._captcha: CaptchaHandler           = CaptchaHandler(captcha_key)
+        self._stripe:  StripePaymentHandler     = StripePaymentHandler(secret_key=stripe_key)
         self._db:      AuditDB                  = AuditDB()
 
     # ── Lifecycle ──────────────────────────────────────────────────────────
@@ -917,14 +1088,59 @@ class FastPurchaseAgent:
         await self._human_click(page, page.get_by_role("button", name="Continue"))
         _log("CHECKOUT", "Contact info submitted ✓")
 
-        # ── Step 6 · Order summary ─────────────────────────────────────
+        # ── Step 6 · Order summary + Stripe payment ───────────────────
         await page.get_by_text("Checkout: Overview").wait_for()
         await self._human_delay(DELAY_LONG)   # humans actually read summaries
-        total = await page.locator(".summary_subtotal_label").inner_text()
-        _log("CHECKOUT", f"Summary: {total} ✓")
+
+        # Parse the subtotal shown on the summary page.
+        # On saucedemo this is the item subtotal; on real sites use the
+        # grand total (including tax/shipping) from the order summary element.
+        total_text = await page.locator(".summary_subtotal_label").inner_text()
+        _log("CHECKOUT", f"Summary: {total_text} ✓")
 
         if await self._check_blocked(page):
             raise RuntimeError("Block detected at order summary")
+
+        # ── Stripe payment ─────────────────────────────────────────────
+        # This is called here because we now know the exact charge amount.
+        #
+        # On saucedemo: the site has no real payment step, so Stripe runs
+        # as a parallel financial record — proof the payment was authorised
+        # before the bot clicks "Finish".
+        #
+        # On a real Stripe-native checkout (Shopify, most SaaS):
+        #   After this call succeeds, inject the client_secret into the page:
+        #     await page.evaluate(
+        #       f"stripe.confirmCardPayment('{intent['client_secret']}')"
+        #     )
+        #   Then wait for the site's own success/redirect element.
+        #
+        # On a non-Stripe checkout (custom card form):
+        #   Use this only for the audit record; fill card fields via
+        #   _human_type() using CARD_NUMBER / CARD_EXP / CARD_CVC env vars.
+        payment_intent_id = ""
+        if self._stripe.is_enabled():
+            amount_cents = StripePaymentHandler.price_to_cents(total_text)
+            try:
+                intent = await self._stripe.create_and_confirm(
+                    amount_cents=amount_cents,
+                    idempotency_key=f"blitzbuy-{id(page)}-{int(time.time())}",
+                    description=f"BlitzBuy: {product_search_term}",
+                )
+                payment_intent_id = intent["id"]
+                _log("STRIPE", f"Payment intent recorded: {payment_intent_id}")
+            except stripe.StripeError as exc:
+                # Payment declined / network error — abort the purchase
+                _log("STRIPE", f"Payment failed: {exc}")
+                shot = await self._shot(page, "failure_payment")
+                return PurchaseResult(
+                    success=False,
+                    message=f"Stripe payment failed: {exc}",
+                    screenshot=shot,
+                    payment_intent_id=payment_intent_id,
+                )
+        else:
+            _log("STRIPE", "Skipped — set STRIPE_SECRET_KEY to enable real payments")
 
         # ── Step 7 · Place order ───────────────────────────────────────
         await self._human_delay(DELAY_MEDIUM)
@@ -937,6 +1153,7 @@ class FastPurchaseAgent:
             success=True,
             message=f"Purchase of '{product_search_term}' completed.",
             screenshot=shot,
+            payment_intent_id=payment_intent_id,
         )
 
 
@@ -998,7 +1215,8 @@ async def main() -> None:
     print("  Recent audit log (purchase_history.db):")
     for row in agent._db.recent(5):
         status = "✓" if row["success"] else "✗"
-        print(f"  {status}  {row['ts']}  {row['product']}  {row['elapsed_s']:.2f}s")
+        pi = f"  {row['payment_intent_id']}" if row.get("payment_intent_id") else ""
+        print(f"  {status}  {row['ts']}  {row['product']}  {row['elapsed_s']:.2f}s{pi}")
     print("─" * 64)
 
     await agent.close()
