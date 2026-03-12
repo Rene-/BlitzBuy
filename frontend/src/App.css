@@ -26,21 +26,31 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; }
   padding: 2rem 1.5rem 4rem;
 }
 
+/* Full-width invisible drag strip fixed at the top of the frameless window.
+   height matches titleBarOverlay.height in electron/main.js (32px).
+   It spans the full window width regardless of the content max-width,
+   which is why the previous header-based approach didn't work on Windows. */
+.drag-strip {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 32px;
+  -webkit-app-region: drag;
+  z-index: 9999;
+  pointer-events: none; /* lets clicks fall through to buttons in the overlay */
+}
+
 .app-header {
   display: flex;
   align-items: center;
   gap: .75rem;
   margin-bottom: 2rem;
-  /* Make the header the drag handle for the frameless window.
-     Electron uses this CSS property to know which region moves the window. */
-  -webkit-app-region: drag;
+  padding-top: 32px; /* push content below the drag strip */
   user-select: none;
 }
 .app-header h1 { font-size: 1.6rem; font-weight: 700; letter-spacing: -.5px; }
 .app-header h1 span { color: var(--accent); }
-/* Any interactive element inside a drag region must opt back out,
-   otherwise clicks on them get swallowed by the drag handler. */
-.app-header .badge { -webkit-app-region: no-drag; }
 .badge {
   font-size: .65rem;
   font-weight: 600;

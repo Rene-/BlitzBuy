@@ -106,6 +106,10 @@ export default function App() {
 
   return (
     <div className="app">
+      {/* Full-width drag strip fixed at the very top of the window.
+          Sits outside the centered container so it spans edge-to-edge.
+          The app-header content sits below it and is purely visual. */}
+      {IS_ELECTRON && <div className="drag-strip" />}
       <header className="app-header">
         <h1>Blitz<span>Buy</span></h1>
         <span className="badge">{IS_ELECTRON ? 'ELECTRON' : 'DEMO'}</span>
