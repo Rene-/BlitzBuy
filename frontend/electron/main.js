@@ -5,6 +5,7 @@
  *  1. Create the BrowserWindow and load the React build
  *  2. Expose IPC handlers so the renderer can invoke blitzbuy.exe / blitzbuy.py
  *  3. Stream stdout/stderr back to the renderer in real time
+ *  4. Write every session to a persistent daily log file in userData/logs/
  */
 
 const { app, BrowserWindow, ipcMain, shell } = require('electron')
@@ -12,22 +13,45 @@ const path  = require('path')
 const { spawn } = require('child_process')
 const fs    = require('fs')
 
-// ── Resolve the Python runner ────────────────────────────────────────────────
+// ── Session logger ────────────────────────────────────────────────────────────
+// Logs are written to:  %APPDATA%\BlitzBuy\logs\YYYY-MM-DD.log
+// One file per day — easy to find, easy to share for debugging.
+
+function logsDir() {
+  const dir = path.join(app.getPath('userData'), 'logs')
+  fs.mkdirSync(dir, { recursive: true })
+  return dir
+}
+
+function todayLogPath() {
+  const date = new Date().toISOString().slice(0, 10)   // YYYY-MM-DD
+  return path.join(logsDir(), `${date}.log`)
+}
+
+function writeLog(line) {
+  const ts    = new Date().toISOString()
+  const entry = `[${ts}] ${line}\n`
+  try {
+    fs.appendFileSync(todayLogPath(), entry, 'utf8')
+  } catch (e) {
+    // Never crash the app over a log write failure
+  }
+}
+
+// ── Resolve the Python runner ─────────────────────────────────────────────────
 // In production (packaged) we ship blitzbuy.exe next to the app resources.
 // In development we fall back to running blitzbuy.py via python directly.
 
 function resolvePythonRunner() {
   if (app.isPackaged) {
-    // electron-builder places extraResources into process.resourcesPath
     const exePath = path.join(process.resourcesPath, 'blitzbuy.exe')
     if (fs.existsSync(exePath)) return { cmd: exePath, args: [] }
   }
-  // Dev fallback — run the .py script
   const scriptPath = path.join(__dirname, '..', '..', 'blitzbuy.py')
   return { cmd: 'python', args: [scriptPath] }
 }
 
-// ── Window ───────────────────────────────────────────────────────────────────
+// ── Window ────────────────────────────────────────────────────────────────────
 
 let mainWindow
 
@@ -49,13 +73,13 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration:  false,
     },
-    // icon: set a .ico file here for a custom app icon
   })
 
   const indexHtml = path.join(__dirname, '..', 'dist', 'index.html')
   mainWindow.loadFile(indexHtml)
 
-  // Open external links in the system browser, not Electron
+  writeLog(`=== BlitzBuy session started (v${app.getVersion()}) ===`)
+
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url)
     return { action: 'deny' }
@@ -70,20 +94,17 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
+  writeLog('=== BlitzBuy session ended ===')
   if (process.platform !== 'darwin') app.quit()
 })
 
-// ── IPC: run-purchase ────────────────────────────────────────────────────────
-//
-// The renderer sends:  { url, product, maxPrice, email, password }
-// We spawn blitzbuy.exe (or blitzbuy.py), passing args as env vars so
-// credentials never appear in process lists.
-// We stream stdout/stderr back line-by-line via 'purchase-log' events,
-// then send a final 'purchase-done' with the result.
+// ── IPC: run-purchase ─────────────────────────────────────────────────────────
 
 ipcMain.handle('run-purchase', async (event, jobConfig) => {
   return new Promise((resolve) => {
     const { cmd, args } = resolvePythonRunner()
+
+    writeLog(`JOB START  url=${jobConfig.url}  product="${jobConfig.product}"  maxPrice=${jobConfig.maxPrice}`)
 
     const env = {
       ...process.env,
@@ -91,19 +112,17 @@ ipcMain.handle('run-purchase', async (event, jobConfig) => {
       BLITZBUY_USER:     jobConfig.email,
       BLITZBUY_PASS:     jobConfig.password,
       BLITZBUY_EMAIL:    jobConfig.email,
-      PYTHONUNBUFFERED:  '1',   // ensure stdout isn't buffered
+      BLITZBUY_PRODUCT:  jobConfig.product,
+      BLITZBUY_MAX_PRICE: String(jobConfig.maxPrice),
+      PYTHONUNBUFFERED:  '1',
     }
-
-    // Inject PRODUCT / MAX_PRICE as env vars too (blitzbuy.py reads them)
-    env.BLITZBUY_PRODUCT   = jobConfig.product
-    env.BLITZBUY_MAX_PRICE = String(jobConfig.maxPrice)
 
     const child = spawn(cmd, args, { env, shell: false })
     const logs  = []
 
     function sendLog(line) {
       logs.push(line)
-      // Forward to renderer if window is still open
+      writeLog(`  ${line}`)
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('purchase-log', { jobId: jobConfig.id, line })
       }
@@ -118,6 +137,7 @@ ipcMain.handle('run-purchase', async (event, jobConfig) => {
 
     child.on('close', code => {
       const success = code === 0
+      writeLog(`JOB END    status=${success ? 'SUCCESS' : 'FAILED'}  exitCode=${code}`)
       resolve({
         success,
         message: success
@@ -129,7 +149,18 @@ ipcMain.handle('run-purchase', async (event, jobConfig) => {
 
     child.on('error', err => {
       sendLog(`[ERROR] Failed to start runner: ${err.message}`)
+      writeLog(`JOB ERROR  ${err.message}`)
       resolve({ success: false, message: err.message, logs })
     })
   })
 })
+
+// ── IPC: open-logs-folder ─────────────────────────────────────────────────────
+
+ipcMain.handle('open-logs-folder', () => {
+  shell.openPath(logsDir())
+})
+
+// ── IPC: get-log-path ─────────────────────────────────────────────────────────
+
+ipcMain.handle('get-log-path', () => todayLogPath())

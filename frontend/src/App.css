@@ -51,6 +51,20 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; }
 }
 .app-header h1 { font-size: 1.6rem; font-weight: 700; letter-spacing: -.5px; }
 .app-header h1 span { color: var(--accent); }
+
+.btn-logs {
+  margin-left: auto;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 6px;
+  padding: .3rem .75rem;
+  font-size: .75rem;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  transition: color .15s, border-color .15s;
+}
+.btn-logs:hover { color: var(--text); border-color: var(--accent); }
 .badge {
   font-size: .65rem;
   font-weight: 600;

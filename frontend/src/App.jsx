@@ -113,6 +113,15 @@ export default function App() {
       <header className="app-header">
         <h1>Blitz<span>Buy</span></h1>
         <span className="badge">{IS_ELECTRON ? 'ELECTRON' : 'DEMO'}</span>
+        {IS_ELECTRON && (
+          <button
+            className="btn-logs"
+            title="Open logs folder"
+            onClick={() => window.blitzBuyAPI.openLogsFolder()}
+          >
+            &#128196; Logs
+          </button>
+        )}
       </header>
 
       <PurchaseForm onSubmit={handleSubmit} isRunning={isRunning} />
